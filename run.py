@@ -1,18 +1,54 @@
 import sounddevice as sd
 import numpy as np
-import torch
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import time
 from threading import Thread
 from queue import Queue
-import logging
+from faster_whisper import WhisperModel
+import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
+import threading
+import queue
+
+import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
+import threading
+import queue
+import time
+
+class HebrewTranscriptionGUI:
+    def __init__(self, title="Hebrew Transcription"):
+        self.root = tk.Tk()
+        self.root.title(title)
+
+        self.text_area = ScrolledText(self.root, wrap=tk.WORD, font=("Arial", 16), width=70, height=25, bg="white", fg="black")
+        self.text_area.pack(expand=True, fill="both")
+
+        # Right-align text with tag
+        self.text_area.tag_configure('rtl', justify='right')
+
+        self.queue = queue.Queue()
+        self.root.after(100, self.update_gui)
+
+    def update_gui(self):
+        while not self.queue.empty():
+            sentence = self.queue.get()
+            self.text_area.insert(tk.END, sentence + "\n", 'rtl')
+            self.text_area.yview(tk.END)
+        self.root.after(100, self.update_gui)
+
+    def add_sentence(self, sentence):
+        self.queue.put(sentence)
+
+    def start(self):
+        self.root.mainloop()
 
 # ─── Configuration ───────────────────────────────────────────────────────────────
 SAMPLE_RATE   = 16000
 CHUNK_SECONDS = 8
-SHIFT_SECONDS = 8   # <=8
-MODEL_NAME    = "ivrit-ai/whisper-large-v3"
-DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+SHIFT_SECONDS = 4
+MODEL_NAME    = "ivrit-ai/whisper-large-v3-turbo-ct2"
+DEVICE        = "cuda" if sd.query_hostapis()[sd.default.hostapi]['name'].lower() == "asio" else "cpu"
+COMPUTE_TYPE  = "int8" if DEVICE == "cpu" else "float16"
 
 # ─── LIST DEVICES ─────────────────────────────────────────────────────────────
 print("🔎 Available audio devices:")
@@ -32,33 +68,16 @@ if device_index is None:
 
 print(f"\n✅ Using device #{device_index}: {devices[device_index]['name']}\n")
 
-# ─── Load Model ───────────────────────────────────────────────────────────────
-logging.getLogger("transformers").setLevel(logging.ERROR)
-print(f"📦 Loading {MODEL_NAME} on {DEVICE}…")
-processor = WhisperProcessor.from_pretrained(MODEL_NAME)
-model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(DEVICE)
+# ─── Load Faster-Whisper Model ───────────────────────────────────────────────
+print(f"📦 Loading {MODEL_NAME} on {DEVICE} (compute_type={COMPUTE_TYPE})…")
+model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
 
 # ─── Transcription Function ───────────────────────────────────────────────────
 def transcribe(audio_np: np.ndarray) -> str:
     if audio_np.ndim > 1:
         audio_np = audio_np.mean(axis=1)
-    inputs = processor(
-        audio_np,
-        sampling_rate=SAMPLE_RATE,
-        return_tensors="pt",
-        return_attention_mask=True
-    )
-    input_features = inputs.input_features.to(DEVICE)
-    attention_mask = torch.ones(
-        input_features.shape[:2], dtype=torch.long, device=DEVICE
-    )
-    forced_decoder_ids = processor.get_decoder_prompt_ids(language="he", task="transcribe")
-    generated_ids = model.generate(
-        input_features,
-        attention_mask=attention_mask,
-        forced_decoder_ids=forced_decoder_ids
-    )
-    return processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    segments, _ = model.transcribe(audio_np, language="he")
+    return " ".join(segment.text for segment in segments).strip()
 
 # ─── Streaming Audio Setup ────────────────────────────────────────────────────
 chunk_queue = Queue()
@@ -83,17 +102,21 @@ def consumer():
     for chunk in producer():
         txt = transcribe(chunk)
 
+        # Optional: reverse each Hebrew word (visual fix)
         sentence = [word[::-1] for word in txt.split()]
         sentence = " ".join(sentence)
 
         ts  = time.strftime("%H:%M:%S", time.localtime())
         print(f"[{ts}] {sentence}")
+        gui.add_sentence(f"[{ts}] {txt}")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    gui = HebrewTranscriptionGUI()  # create GUI
+
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
-        channels=2,                   # CABLE Output is stereo
+        channels=2,
         callback=audio_callback,
         device=device_index
     )
@@ -103,6 +126,8 @@ if __name__ == "__main__":
     t = Thread(target=consumer, daemon=True)
     t.start()
 
+    gui.start()
+
     try:
         while True:
             time.sleep(1)
@@ -110,3 +135,4 @@ if __name__ == "__main__":
         print("\n🛑 Stopped.")
         stream.stop()
         stream.close()
+

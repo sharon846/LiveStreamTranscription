@@ -1,0 +1,4 @@
+{
+  "News12": "https://www.mako.co.il/mako-vod-live-tv/VOD-6540b8dcb64fd31006.htm",
+  "News11": "https://www.kan.org.il/live/"
+}

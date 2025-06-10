@@ -1,100 +1,141 @@
-import numpy as np
 import sounddevice as sd
-import threading
-import queue
+import numpy as np
 import time
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from threading import Thread
+from queue import Queue
+from faster_whisper import WhisperModel
+import tkinter as tk
+from tkinter.scrolledtext import ScrolledText
+import queue
 
-# === CONFIG ===
-SAMPLE_RATE = 44100
-CHUNK_SECONDS = 4
-SHIFT_SECONDS = 2
-CHUNK_SIZE = SAMPLE_RATE * CHUNK_SECONDS
-SHIFT_SIZE = SAMPLE_RATE * SHIFT_SECONDS
+class HebrewTranscriptionGUI:
+    def __init__(self, title="Hebrew Transcription"):
+        self.root = tk.Tk()
+        self.root.title(title)
 
-# Live pages you want to listen to
-PAGES = [
-    {"url": "https://www.kan.org.il/live/", "device_name": "CABLE-C Output"},
-    {"url": "https://www.mako.co.il/mako-vod-live-tv/VOD-6540b8dcb64fd31006.htm", "device_name": "CABLE-D Output"},
-]
+        self.text_area = ScrolledText(self.root, wrap=tk.WORD, font=("Arial", 16), width=70, height=25, bg="white", fg="black")
+        self.text_area.pack(expand=True, fill="both")
 
-chunk_queue = queue.Queue()
+        # Right-align text with tag
+        self.text_area.tag_configure('rtl', justify='right')
 
-# Your transcribe function
-def transcribe(chunk):
-    print("🔊 Transcribing chunk of shape:", chunk.shape)
+        self.queue = queue.Queue()
+        self.root.after(100, self.update_gui)
 
-# Capture raw audio stream from a specific device
-def capture_stream(device_name):
-    index = None
-    for i, dev in enumerate(sd.query_devices()):
-        if device_name.lower() in dev["name"].lower() and dev["max_input_channels"] > 0:
-            index = i
-            break
+    def update_gui(self):
+        while not self.queue.empty():
+            sentence = self.queue.get()
+            self.text_area.insert(tk.END, sentence + "\n", 'rtl')
+            self.text_area.yview(tk.END)
+        self.root.after(100, self.update_gui)
 
-    if index is None:
-        raise RuntimeError(f"Audio input device '{device_name}' not found!")
+    def add_sentence(self, sentence):
+        self.queue.put(sentence)
 
-    print(f"🎧 Capturing from device: {device_name} (index={index})")
+    def start(self):
+        self.root.mainloop()
 
-    def callback(indata, frames, time, status):
-        if status:
-            print("⚠️  Audio warning:", status)
-        chunk_queue.put(indata[:, 0].copy())
+# ─── Configuration ───────────────────────────────────────────────────────────────
+SAMPLE_RATE   = 16000
+CHUNK_SECONDS = 8
+SHIFT_SECONDS = 4
+MODEL_NAME    = "ivrit-ai/whisper-large-v3-turbo-ct2"
+DEVICE        = "cuda" if sd.query_hostapis()[sd.default.hostapi]['name'].lower() == "asio" else "cpu"
+COMPUTE_TYPE  = "int8" if DEVICE == "cpu" else "float16"
+
+# ─── LIST DEVICES ─────────────────────────────────────────────────────────────
+print("🔎 Available audio devices:")
+devices = sd.query_devices()
+for i, d in enumerate(devices):
+    print(f"{i}: {d['name']} ({d['hostapi']})")
+
+# Find the index of "CABLE Output"
+target_device_name = "CABLE Output"
+device_index = next(
+    (i for i, d in enumerate(devices) if target_device_name in d["name"]),
+    None
+)
+
+if device_index is None:
+    raise RuntimeError(f"Device '{target_device_name}' not found. Make sure VB-Cable is installed.")
+
+print(f"\n✅ Using device #{device_index}: {devices[device_index]['name']}\n")
+
+# ─── Load Faster-Whisper Model ───────────────────────────────────────────────
+print(f"📦 Loading {MODEL_NAME} on {DEVICE} (compute_type={COMPUTE_TYPE})…")
+model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+# ─── Transcription Function ───────────────────────────────────────────────────
+def transcribe(audio_np: np.ndarray) -> str:
+    if audio_np.ndim > 1:
+        audio_np = audio_np.mean(axis=1)
+    segments, _ = model.transcribe(audio_np, language="he")
+    return " ".join(segment.text for segment in segments).strip()
+
+# ─── Streaming Audio Setup ────────────────────────────────────────────────────
+chunk_queue = Queue()
+
+def audio_callback(indata, frames, time_info, status):
+    mono = indata.mean(axis=1).astype(np.float32)
+    chunk_queue.put(mono)
+
+def producer():
+    buf      = np.empty((0,), dtype=np.float32)
+    chunk_sz = SAMPLE_RATE * CHUNK_SECONDS
+    shift_sz = SAMPLE_RATE * SHIFT_SECONDS
+
+    while True:
+        data = chunk_queue.get()
+        buf  = np.concatenate([buf, data])
+        while len(buf) >= chunk_sz:
+            yield buf[:chunk_sz]
+            buf = buf[shift_sz:]
+
+def clear_prv_text(txt):
+    max_len = min(len(prv_text), len(txt))
+    for i in range(max_len, 0, -1):
+        if prv_text[-i:] == txt[:i]:
+            return txt[i:]
+    return txt
+
+prv_text = ""
+def consumer():
+    global prv_text
+    for chunk in producer():
+        txt = transcribe(chunk)
+        #txt = clear_prv_text(txt)
+
+        # Optional: reverse each Hebrew word (visual fix)
+        sentence = [word[::-1] for word in txt.split()]
+        sentence = " ".join(sentence)
+
+        ts  = time.strftime("%H:%M:%S", time.localtime())
+        print(f"[{ts}] {sentence}")
+        gui.add_sentence(f"[{ts}] {txt}")
+        prv_text = txt
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    gui = HebrewTranscriptionGUI()  # create GUI
 
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        blocksize=SHIFT_SIZE,
-        callback=callback,
-        device=index,
+        channels=2,
+        callback=audio_callback,
+        device=device_index
     )
     stream.start()
-    return stream
+    print("🔴 Capturing from CABLE Output (Ctrl+C to stop)…")
 
-# Launch Chrome tab with the AudioPick extension enabled
-def launch_chrome_tab(url):
-    chrome_options = Options()
-    chrome_options.add_argument("--use-fake-ui-for-media-stream")
-    chrome_options.add_argument("--autoplay-policy=no-user-gesture-required")
-    chrome_options.add_argument("--disable-notifications")
-    chrome_options.add_argument("--new-window")
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.get(url)
-    print(f"🌐 Launched tab: {url}")
-    return driver  # keep this alive
+    t = Thread(target=consumer, daemon=True)
+    t.start()
 
-# Chunk generator for transcribe()
-def chunk_generator():
-    buf = np.empty((0,), dtype=np.float32)
-    while True:
-        data = chunk_queue.get()
-        buf = np.concatenate([buf, data])
-        while len(buf) >= CHUNK_SIZE:
-            yield buf[:CHUNK_SIZE]
-            buf = buf[SHIFT_SIZE:]
+    gui.start()
 
-# Worker to consume chunks
-def transcribe_worker():
-    for chunk in chunk_generator():
-        transcribe(chunk)
-
-# === MAIN ===
-if __name__ == "__main__":
-    # Start audio capture per virtual device
-    streams = []
-    for page in PAGES:
-        streams.append(capture_stream(page["device_name"]))
-        launch_chrome_tab(page["url"])
-        time.sleep(2)  # Let page load & start audio
-
-    # Start transcription worker
-    threading.Thread(target=transcribe_worker, daemon=True).start()
-
-    # Keep alive
     try:
-        threading.Event().wait()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("🛑 Exiting…")
+        print("\n🛑 Stopped.")
+        stream.stop()
+        stream.close()

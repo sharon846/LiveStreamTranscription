@@ -77,11 +77,11 @@ def upload_audio():
     except IOError as e:
         abort(500, description=f"Write failed: {e}")
 
-    audio_np = decode_webm_chunk_ffmpeg(request.data)
+    #audio_np = decode_webm_chunk_ffmpeg(request.data)
 
-    if audio_np.size > 0:
-        text = transcribe(audio_np)
-        print(f"[{tab_title}] {text}")
+    #if audio_np.size > 0:
+    #    text = transcribe(audio_np)
+    #    print(f"[{tab_title}] {text}")
 
     return "OK", 200
 
